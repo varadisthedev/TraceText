@@ -48,28 +48,53 @@ def split_sentences(text: str) -> list[str]:
     return [s.strip() for s in SENTENCE_SPLIT_RE.split(text.strip()) if s.strip()]
 
 
-MIN_WORDS_PER_CHUNK = 40  # TF-IDF on shorter chunks is too sparse/noisy to score reliably
+# Training passages were filtered to 50–500 words (mean ~203 words).
+# Keep inference inputs in a comparable size range instead of scoring tiny sentences.
+MIN_RELIABLE_WORDS = 50
+TRAINING_MAX_WORDS = 500
+TARGET_CHUNK_WORDS = 220
+CHUNK_OVERLAP_WORDS = 40
 
 
-def chunk_text(text: str, max_chunks: int = 10) -> list[str]:
-    """Group sentences into up to `max_chunks` roughly equal chunks, each with
-    at least MIN_WORDS_PER_CHUNK words so short inputs aren't over-split into
-    noisy single-sentence chunks."""
-    sentences = split_sentences(text)
-    if not sentences:
+def chunk_text(text: str) -> list[str]:
+    """Keep normal passages intact; split only long inputs into overlapping windows.
+
+    Windows are similar in size to the passages used during training. This reduces
+    the train/inference mismatch caused by scoring 30–60-word sentence groups.
+    """
+    clean_text = text.strip()
+    words = clean_text.split()
+    if not words:
         return []
-    word_count = len(text.split())
-    n_chunks = max(1, min(max_chunks, len(sentences), word_count // MIN_WORDS_PER_CHUNK))
-    chunk_size = -(-len(sentences) // n_chunks)  # ceil div
-    return [
-        " ".join(sentences[i : i + chunk_size])
-        for i in range(0, len(sentences), chunk_size)
-    ]
+    if len(words) <= TRAINING_MAX_WORDS:
+        return [clean_text]
+
+    chunks = []
+    start = 0
+    step = TARGET_CHUNK_WORDS - CHUNK_OVERLAP_WORDS
+    while start < len(words):
+        end = min(start + TARGET_CHUNK_WORDS, len(words))
+        # Avoid leaving a final fragment shorter than the training minimum.
+        if 0 < len(words) - end < MIN_RELIABLE_WORDS:
+            end = len(words)
+        chunks.append(" ".join(words[start:end]))
+        if end == len(words):
+            break
+        start += step
+    return chunks
 
 
 def analyze(text: str):
+    word_count = len(text.split())
+    if word_count < MIN_RELIABLE_WORDS:
+        raise ValueError(
+            f"Please enter at least {MIN_RELIABLE_WORDS} words. "
+            "The current model was not trained or validated on shorter passages."
+        )
     chunks = chunk_text(text)
-    probs = model.predict_proba(chunks)[:, AI_CLASS_INDEX]  # P(AI) per chunk
+    if not chunks:
+        raise ValueError("Please enter some readable text.")
+    probs = model.predict_proba(chunks)[:, AI_CLASS_INDEX]  # model-estimated AI-like score per window
     weights = np.array([max(len(c.split()), 1) for c in chunks], dtype=float)
     ai_pct = float(np.average(probs, weights=weights) * 100)
     sentences = split_sentences(text)
@@ -97,7 +122,7 @@ AI_SAMPLE = (
     "approach problem-solving. Furthermore, these systems are capable of processing "
     "vast amounts of information in a fraction of the time required by traditional "
     "methods. In conclusion, continued research into responsible AI development "
-    "remains essential to fully realize these benefits."
+    "remains essential to fully realize these benefits. These patterns deserve careful evaluation."
 )
 MIXED_SAMPLE = (
     HUMAN_SAMPLE
@@ -270,11 +295,17 @@ with col_in:
         )
 
         if predict_clicked:
-            if text.strip():
-                st.session_state.result = analyze(text)
-            else:
+            if not text.strip():
                 st.session_state.result = None
                 st.warning("Enter some text first.")
+            elif len(text.split()) < MIN_RELIABLE_WORDS:
+                st.session_state.result = None
+                st.warning(
+                    f"This model was trained on passages of at least {MIN_RELIABLE_WORDS} words. "
+                    f"Your text has {len(text.split())} words, so a prediction would be unreliable."
+                )
+            else:
+                st.session_state.result = analyze(text)
 
 with col_out:
     with st.container(border=True):
@@ -291,9 +322,9 @@ with col_out:
             ai_pct, human_pct = result["ai_pct"], result["human_pct"]
             verdict_ai = ai_pct >= 50
             verdict_color = RED if verdict_ai else GREEN
-            verdict_label = "AI Generated" if verdict_ai else "Human Written"
+            verdict_label = "AI-like signals" if verdict_ai else "Human-like signals"
             verdict_icon = "smart_toy" if verdict_ai else "person"
-            confidence = max(ai_pct, human_pct)
+            top_score = max(ai_pct, human_pct)
 
             st.write("")
             c1, c2 = st.columns([1, 1], vertical_alignment="center")
@@ -303,8 +334,8 @@ with col_out:
                 unsafe_allow_html=True,
             )
             c2.markdown(
-                f'<div style="text-align:right;"><div class="confidence-value">{confidence:.1f}%</div>'
-                f'<div class="confidence-label">ensembled confidence</div></div>',
+                f'<div style="text-align:right;"><div class="confidence-value">{top_score:.1f}%</div>'
+                f'<div class="confidence-label">highest model score · not calibrated</div></div>',
                 unsafe_allow_html=True,
             )
 
@@ -337,7 +368,7 @@ with col_out:
                     margin=dict(l=0, r=0, t=0, b=0),
                     height=160,
                     annotations=[
-                        dict(text=f"{ai_pct:.0f}%<br>AI", x=0.5, y=0.5, font_size=17, showarrow=False)
+                        dict(text=f"{ai_pct:.0f}%<br>AI-like", x=0.5, y=0.5, font_size=17, showarrow=False)
                     ],
                 )
                 st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
@@ -355,9 +386,10 @@ with col_out:
                 )
 
             st.info(
-                f"Scored **{ai_pct:.1f}% AI / {human_pct:.1f}% human**, averaged across chunks "
-                "and weighted by chunk length. This is a probability from a TF-IDF + "
-                "logistic-regression baseline — a signal, not a verdict."
+                f"The model score leans **{ai_pct:.1f}% AI-like / {human_pct:.1f}% human-like**, "
+                "averaged across the passage windows and weighted by word count. "
+                "These are model scores, not calibrated real-world probabilities or proof of authorship. "
+                "The deployed classifier is TF-IDF + SGDClassifier, not logistic regression."
             )
 
 # --- chunk breakdown -----------------------------------------------------
@@ -367,7 +399,7 @@ if st.session_state.result:
     with st.container(border=True):
         card_header(
             "grid_view", "Chunk-by-Chunk Breakdown",
-            "Up to 10 chunks, each scored independently and then ensembled into the result above.",
+            "Short passages (50–500 words) are scored as one passage; longer inputs use overlapping word windows.",
         )
         st.write("")
         rows = []
@@ -475,12 +507,12 @@ with st.container(border=True):
         unsafe_allow_html=True,
     )
     st.write("")
-    TOTAL_ROWS = 3960 + TEST_REPORT["Human"]["support"] + TEST_REPORT["AI"]["support"]
+    TOTAL_ROWS = 3960  # the 808 held-out rows are a subset of these 3,960 passages
     stat_row(
         [
-            (f"{TOTAL_ROWS:,}", "Total Passages"),
-            ("3,960", "Training Rows"),
-            (f"{TEST_REPORT['Human']['support'] + TEST_REPORT['AI']['support']:,}", "Test Rows"),
+            (f"{TOTAL_ROWS:,}", "Unique Dataset Passages"),
+            ("3,960", "Final Model Fit Rows"),
+            (f"{TEST_REPORT['Human']['support'] + TEST_REPORT['AI']['support']:,}", "Held-Out Test Rows (subset)"),
         ]
     )
 
