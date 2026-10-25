@@ -16,7 +16,7 @@ INK = "#020100"
 GREEN = "#1E8E3E"    # Human (not in the brand palette; added for red/green AI-vs-human signal)
 MUTED = "#6B7280"
 
-MODEL_PATH = "models/tracetext_model.joblib"
+MODEL_PATH = "models/tracetext_char_hybrid_experiment4.joblib"
 BANNER_PATH = "assets/ai_or_human_banner_900x300(1).png"
 GITHUB_URL = "https://github.com/varadisthedev/TraceText"
 DATASET_URL = "https://huggingface.co/datasets/liamdugan/raid"
@@ -26,8 +26,8 @@ st.set_page_config(page_title="TraceText", page_icon=":material/fingerprint:", l
 # --- model -------------------------------------------------------------
 @st.cache_resource
 def load_model():
-    # models/tracetext_model.joblib is first-party, committed by the project
-    # owner (not user-uploaded), so loading this pickle is trusted.
+    # models/tracetext_char_hybrid_experiment4.joblib is first-party, committed
+    # by the project owner (not user-uploaded), so loading this pickle is trusted.
     # The pickled SGDClassifier's Cython loss object reports its module as the
     # bare name "_loss" instead of "sklearn._loss.loss" (a known sklearn
     # pickling quirk from the Colab build). Alias it so joblib can resolve it.
@@ -109,6 +109,131 @@ def analyze(text: str):
         "avg_sentence_len": len(words) / len(sentences) if sentences else 0,
     }
 
+
+def _pipeline_parts():
+    """Return the Experiment 3 word vectorizer, char vectorizer and classifier."""
+    features = model.named_steps.get("features")
+    classifier = model.named_steps.get("classifier")
+    if features is None or classifier is None or not hasattr(classifier, "coef_"):
+        return None, None, None
+    transformers = dict(features.transformer_list)
+    return transformers.get("word_tfidf"), transformers.get("char_tfidf"), classifier
+
+
+def _ai_oriented_coefficients(classifier):
+    coef = np.asarray(classifier.coef_).reshape(-1).astype(float)
+    # For binary sklearn classifiers, coef_ points toward classes_[1].
+    # Flip when class 1 (AI) is classes_[0] so positive always means AI.
+    if list(model.classes_).index(1) == 0:
+        coef = -coef
+    return coef
+
+
+def explain_chunk(chunk: str, top_n: int = 6):
+    """Explain a chunk using active word and character n-gram contributions."""
+    word_vec, char_vec, classifier = _pipeline_parts()
+    if word_vec is None or char_vec is None or classifier is None:
+        return [], []
+
+    coefficients = _ai_oriented_coefficients(classifier)
+    word_count = len(word_vec.vocabulary_)
+    word_matrix = word_vec.transform([chunk]).tocsr()
+    char_matrix = char_vec.transform([chunk]).tocsr()
+    items = []
+    if word_matrix.nnz:
+        names = word_vec.get_feature_names_out()
+        for idx, value in zip(word_matrix.indices, word_matrix.data):
+            items.append((str(names[idx]), float(value * coefficients[idx])))
+    if char_matrix.nnz:
+        names = char_vec.get_feature_names_out()
+        for idx, value in zip(char_matrix.indices, char_matrix.data):
+            items.append((f"[char: {names[idx]}]", float(value * coefficients[word_count + idx])))
+    ai_push = sorted((x for x in items if x[1] > 0), key=lambda x: x[1], reverse=True)[:top_n]
+    human_push = sorted((x for x in items if x[1] < 0), key=lambda x: x[1])[:top_n]
+    return ai_push, human_push
+
+
+def highlight_chunk(chunk: str) -> str:
+    """Render the entire passage green; only meaningful AI-leaning tokens turn red.
+
+    Scores combine word/phrase and character n-gram contributions. Human-leaning,
+    neutral, and otherwise unscored text stays green, so there are no uncolored gaps.
+    """
+    word_vec, char_vec, classifier = _pipeline_parts()
+    if word_vec is None or char_vec is None or classifier is None:
+        return f'<span class="human-text">{html.escape(chunk)}</span>'
+
+    coefficients = _ai_oriented_coefficients(classifier)
+    word_count = len(word_vec.vocabulary_)
+    token_matches = list(re.finditer(r"\S+", chunk))
+    if not token_matches:
+        return f'<span class="human-text">{html.escape(chunk)}</span>'
+    token_scores = np.zeros(len(token_matches), dtype=float)
+    char_scores = np.zeros(len(chunk), dtype=float)
+
+    # Word/phrase n-gram contributions are assigned to each token they cover.
+    wm = word_vec.transform([chunk]).tocsr()
+    word_names = word_vec.get_feature_names_out()
+    for idx, value in zip(wm.indices, wm.data):
+        contribution = float(value * coefficients[idx])
+        feature = str(word_names[idx]).strip()
+        if not feature:
+            continue
+        pattern = r"(?<!\w)" + r"\s+".join(re.escape(part) for part in feature.split()) + r"(?!\w)"
+        for match in re.finditer(pattern, chunk, flags=re.IGNORECASE):
+            for ti, token in enumerate(token_matches):
+                if token.start() < match.end() and token.end() > match.start():
+                    token_scores[ti] += contribution / max(1, len(feature.split()))
+
+    # Character n-gram contributions are spread over matching character spans,
+    # then averaged into the tokens they overlap. This is an approximate local
+    # explanation of a linear model, not a causal attribution.
+    cm = char_vec.transform([chunk]).tocsr()
+    char_names = char_vec.get_feature_names_out()
+    char_weights = np.zeros(len(chunk), dtype=float)
+    char_hits = np.zeros(len(chunk), dtype=float)
+    lower_chunk = chunk.lower()
+    for idx, value in zip(cm.indices, cm.data):
+        contribution = float(value * coefficients[word_count + idx])
+        feature = str(char_names[idx]).lower()
+        if not feature:
+            continue
+        pos = 0
+        while True:
+            found = lower_chunk.find(feature, pos)
+            if found < 0:
+                break
+            stop = found + len(feature)
+            char_weights[found:stop] += contribution
+            char_hits[found:stop] += 1
+            pos = found + 1
+    char_scores = np.divide(char_weights, char_hits, out=np.zeros_like(char_weights), where=char_hits > 0)
+    for ti, token in enumerate(token_matches):
+        span = char_scores[token.start():token.end()]
+        if span.size:
+            token_scores[ti] += float(np.mean(span))
+
+    # Only clearly positive tokens become red. Everything else remains green.
+    positive = token_scores[token_scores > 0]
+    if not positive.size:
+        red_threshold = float("inf")
+    else:
+        red_threshold = max(float(np.quantile(positive, 0.55)) * 0.65, float(positive.max()) * 0.10, 1e-7)
+
+    pieces = []
+    cursor = 0
+    for i, token in enumerate(token_matches):
+        if token.start() > cursor:
+            pieces.append(f'<span class="human-text">{html.escape(chunk[cursor:token.start()])}</span>')
+        token_text = html.escape(token.group())
+        if token_scores[i] >= red_threshold:
+            pieces.append(f'<span class="ai-word" title="AI-leaning model feature">{token_text}</span>')
+        else:
+            pieces.append(f'<span class="human-text">{token_text}</span>')
+        cursor = token.end()
+    if cursor < len(chunk):
+        pieces.append(f'<span class="human-text">{html.escape(chunk[cursor:])}</span>')
+    return "".join(pieces)
 
 # --- samples -----------------------------------------------------------
 HUMAN_SAMPLE = (
@@ -220,6 +345,9 @@ st.markdown(
         font-size: 0.92rem;
         border-left: 4px solid transparent;
     }}
+    .human-text {{ background: #E8F5EA; color: #14532D; border-radius: 2px; }}
+    .ai-word {{ background: #FDECEC; color: #991B1B; border-radius: 3px; font-weight: 650; }}
+    .chunk-span {{ background: #E8F5EA; border-left-color: {GREEN}; color: #14532D; }}
     .chunk-tag {{
         font-size: 0.68rem;
         font-weight: 700;
@@ -389,7 +517,7 @@ with col_out:
                 f"The model score leans **{ai_pct:.1f}% AI-like / {human_pct:.1f}% human-like**, "
                 "averaged across the passage windows and weighted by word count. "
                 "These are model scores, not calibrated real-world probabilities or proof of authorship. "
-                "The deployed classifier is TF-IDF + SGDClassifier, not logistic regression."
+                "The deployed classifier is word + character TF-IDF with SGDClassifier."
             )
 
 # --- chunk breakdown -----------------------------------------------------
@@ -404,31 +532,70 @@ if st.session_state.result:
         st.write("")
         rows = []
         for i, (chunk, prob) in enumerate(zip(result["chunks"], result["probs"]), start=1):
-            is_ai = prob >= 0.5
-            color = RED if is_ai else GREEN
-            tint = "#FDECEC" if is_ai else "#E8F5EA"
-            tag = f"AI {prob * 100:.0f}%" if is_ai else f"HUMAN {(1 - prob) * 100:.0f}%"
+            # Keep the whole chunk green; highlight only AI-leaning words/phrases red.
+            tag = f"AI-like score {prob * 100:.0f}%"
             rows.append(
-                f'<div class="chunk-span" style="background:{tint};border-left-color:{color};">'
-                f'<span class="chunk-tag" style="background:{color};">chunk {i} · {tag}</span>'
-                f"{html.escape(chunk)}</div>"
+                f'<div class="chunk-span" style="background:#E8F5EA;border-left-color:{GREEN};">'
+                f'<span class="chunk-tag" style="background:{BLUE};">chunk {i} · {tag}</span>'
+                f"{highlight_chunk(chunk)}</div>"
             )
         st.markdown(f'<div class="chunk-list">{"".join(rows)}</div>', unsafe_allow_html=True)
+        st.caption("Green is the default for all text (including neutral/unscored text); red marks words the model's learned features lean toward AI. These highlights are approximate explanations, not proof of authorship.")
+
+    with st.container(border=True):
+        card_header(
+            "manage_search", "Why the Model Scored It This Way",
+            "Local feature contributions from Experiment 3 word + character TF-IDF and SGD. Positive contributions push toward AI; negative contributions push toward human.",
+            accent=BLUE,
+        )
+        st.caption(
+            "These are patterns the model learned from its training data, not proof that a phrase was written by AI. "
+            "A feature's contribution depends on its value in this specific chunk."
+        )
+        for i, chunk in enumerate(result["chunks"], start=1):
+            with st.expander(f"Chunk {i} — inspect influential words and phrases", expanded=(i == 1)):
+                ai_push, human_push = explain_chunk(chunk)
+                if not ai_push and not human_push:
+                    st.info("No vocabulary features from the fitted TF-IDF model were active for this chunk, or the saved model does not expose linear coefficients.")
+                    continue
+                left, right = st.columns(2, gap="medium")
+                with left:
+                    st.markdown(f"**Pushes toward AI** <span style='color:{RED};'>●</span>", unsafe_allow_html=True)
+                    if ai_push:
+                        for feature, contribution in ai_push:
+                            st.markdown(
+                                f"<div style='padding:.4rem .55rem;margin:.25rem 0;border-left:3px solid {RED};background:#FDECEC;border-radius:5px;'>"
+                                f"<span style='font-weight:600;color:#7F1D1D;'>{html.escape(feature)}</span>"
+                                f"<span style='float:right;color:#7F1D1D;'>+{contribution:.4f}</span></div>",
+                                unsafe_allow_html=True,
+                            )
+                    else:
+                        st.caption("No positive feature contributions in this chunk.")
+                with right:
+                    st.markdown(f"**Pushes toward human** <span style='color:{GREEN};'>●</span>", unsafe_allow_html=True)
+                    if human_push:
+                        for feature, contribution in human_push:
+                            st.markdown(
+                                f"<div style='padding:.4rem .55rem;margin:.25rem 0;border-left:3px solid {GREEN};background:#E8F5EA;border-radius:5px;'>"
+                                f"<span style='font-weight:600;color:#14532D;'>{html.escape(feature)}</span>"
+                                f"<span style='float:right;color:#14532D;'>{contribution:.4f}</span></div>",
+                                unsafe_allow_html=True,
+                            )
+                    else:
+                        st.caption("No negative feature contributions in this chunk.")
 
 st.write("")
 
-# --- model performance (real numbers from the training notebook's grouped
-# 5-fold CV and held-out test split — notebook/TraceText_MLDS_Final_Improved.ipynb) ---
+# --- model performance (Experiment 4: RAID + DACTYL modern-LLM data) ---
 CV_COMPARISON = [
-    ("TF-IDF + SGD Classifier", 0.899, 0.914, 0.881, 0.897),
-    ("TF-IDF + Logistic Regression", 0.883, 0.877, 0.890, 0.883),
-    ("TF-IDF + Multinomial NB", 0.736, 0.672, 0.917, 0.775),
+    ("Word + Character TF-IDF + SGD (Experiment 4)", 0.896, 0.930, 0.857, 0.892),
+    ("Previous RAID-only model (Experiment 3)", 0.909, 0.935, 0.878, 0.906),
 ]
 TEST_REPORT = {
-    "Human": dict(precision=0.88, recall=0.90, f1=0.89, support=403),
-    "AI": dict(precision=0.89, recall=0.88, f1=0.89, support=405),
+    "Human": dict(precision=0.90, recall=0.93, f1=0.91, support=792),
+    "AI": dict(precision=0.92, recall=0.90, f1=0.91, support=791),
 }
-TEST_ACCURACY = 0.89
+TEST_ACCURACY = 0.91
 
 perf_col, info_col = st.columns([1.4, 1], gap="medium")
 
@@ -455,7 +622,7 @@ with perf_col:
             plot_bgcolor="rgba(0,0,0,0)",
         )
         st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
-        st.caption("Deployed here: **TF-IDF + SGD Classifier** — best mean CV F1 (0.897).")
+        st.caption("Deployed here: **Word + Character TF-IDF + SGD (Experiment 4)** — mean grouped-CV F1 about 0.892, trained on RAID plus modern-generator (GPT-4o, Claude, Gemini) text.")
 
         st.write("")
         st.markdown(
@@ -481,14 +648,16 @@ with info_col:
     with st.container(border=True):
         card_header("inventory_2", "Model Information")
         st.write("")
-        tfidf = model.named_steps["tfidf"]
+        word_vec, char_vec, classifier = _pipeline_parts()
+        word_vocab = len(word_vec.vocabulary_) if word_vec is not None else 0
+        char_vocab = len(char_vec.vocabulary_) if char_vec is not None else 0
         stat_row(
-            [("SGD Classifier", "Model"), (f"{tfidf.ngram_range[0]}–{tfidf.ngram_range[1]}-gram TF-IDF", "Features")],
+            [("SGD Classifier", "Model"), ("Word + character TF-IDF", "Features")],
             cols=2,
         )
         st.write("")
         stat_row(
-            [(f"{len(tfidf.vocabulary_):,}", "Vocabulary Terms"), ("3,960", "Training Rows")],
+            [(f"{word_vocab + char_vocab:,}", "Combined Features"), ("7,919", "Training Rows")],
             cols=2,
         )
 
@@ -499,19 +668,21 @@ with st.container(border=True):
     st.write("")
     st.markdown(
         f"""
-        <span style="color:{GREEN};">●</span> 1,980 Human&nbsp;&nbsp;
-        <span style="color:{RED};">●</span> 1,980 AI &nbsp;&nbsp;
+        <span style="color:{GREEN};">●</span> 3,959 Human&nbsp;&nbsp;
+        <span style="color:{RED};">●</span> 3,960 AI &nbsp;&nbsp;
         <span style="color:{MUTED};">— balanced sample from
-        <a href="{DATASET_URL}" target="_blank">RAID</a> (Robust AI Detection)</span>
+        <a href="{DATASET_URL}" target="_blank">RAID</a> and
+        <a href="https://huggingface.co/datasets/ShantanuT01/DACTYL" target="_blank">DACTYL</a>
+        (GPT-4o, Claude, Gemini, and other modern generators)</span>
         """,
         unsafe_allow_html=True,
     )
     st.write("")
-    TOTAL_ROWS = 3960  # the 808 held-out rows are a subset of these 3,960 passages
+    TOTAL_ROWS = 7919  # the 1,583 held-out rows are a subset of these 7,919 passages
     stat_row(
         [
             (f"{TOTAL_ROWS:,}", "Unique Dataset Passages"),
-            ("3,960", "Final Model Fit Rows"),
+            (f"{TOTAL_ROWS:,}", "Final Model Fit Rows"),
             (f"{TEST_REPORT['Human']['support'] + TEST_REPORT['AI']['support']:,}", "Held-Out Test Rows (subset)"),
         ]
     )
