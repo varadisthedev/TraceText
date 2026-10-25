@@ -48,12 +48,18 @@ def split_sentences(text: str) -> list[str]:
     return [s.strip() for s in SENTENCE_SPLIT_RE.split(text.strip()) if s.strip()]
 
 
+MIN_WORDS_PER_CHUNK = 40  # TF-IDF on shorter chunks is too sparse/noisy to score reliably
+
+
 def chunk_text(text: str, max_chunks: int = 10) -> list[str]:
-    """Group sentences into up to `max_chunks` roughly equal chunks."""
+    """Group sentences into up to `max_chunks` roughly equal chunks, each with
+    at least MIN_WORDS_PER_CHUNK words so short inputs aren't over-split into
+    noisy single-sentence chunks."""
     sentences = split_sentences(text)
     if not sentences:
         return []
-    n_chunks = min(max_chunks, len(sentences))
+    word_count = len(text.split())
+    n_chunks = max(1, min(max_chunks, len(sentences), word_count // MIN_WORDS_PER_CHUNK))
     chunk_size = -(-len(sentences) // n_chunks)  # ceil div
     return [
         " ".join(sentences[i : i + chunk_size])
